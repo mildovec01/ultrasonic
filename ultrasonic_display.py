@@ -1,132 +1,112 @@
-from gpiozero import DistanceSensor
-from time import monotonic, sleep
+from gpiozero import DistanceSensor, TonalBuzzer
+from gpiozero.tones import Tone
 from RPLCD.i2c import CharLCD
-import errno
+from time import monotonic, sleep
 
-def make_lcd():
-    return CharLCD('PCF8574', address=0x27, port=1, cols=16, rows=2, charmap='A00')
+# ---------------- LCD ----------------
+# I2C LCD (address: 0x27, 16x2)
+lcd = CharLCD('PCF8574', address=0x27, port=1, cols=16, rows=2, charmap='A00')
+lcd.backlight_enabled = True
 
-lcd = make_lcd()
+# ---------------- Ultrasonic Sensors ----------------
+# Arduino TRIG1=4 ECHO1=3  -> RPi GPIO: nastav si podle svého zapojení
+# Arduino TRIG2=11 ECHO2=10 -> RPi GPIO: nastav si podle svého zapojení
+#
+# TY ses držel: A: trigger=17 echo=27, B: trigger=18 echo=22
+TRIG1, ECHO1 = 17, 27
+TRIG2, ECHO2 = 18, 22
 
-def lcd_safe_write(line1, line2="", retries=8):
-    global lcd
-    for i in range(retries):
-        try:
-            lcd.clear()
-            lcd.write_string(line1[:16])
-            lcd.cursor_pos = (1, 0)
-            lcd.write_string(line2[:16])
-            return True
-        except OSError as e:
-            if getattr(e, "errno", None) == errno.EREMOTEIO:  # 121
-                sleep(0.05)
-                # zkus znovu inicializovat LCD (často pomůže)
-                try:
-                    lcd = make_lcd()
-                except Exception:
-                    pass
-                continue
-            raise
-    return False
+sensor1 = DistanceSensor(trigger=TRIG1, echo=ECHO1, max_distance=2.0)
+sensor2 = DistanceSensor(trigger=TRIG2, echo=ECHO2, max_distance=2.0)
 
+# ---------------- Passive Buzzer ----------------
+# Arduino BUZZER_PIN=9 -> RPi GPIO: nastav si podle zapojení
+BUZZER_PIN = 9
+buzzer = TonalBuzzer(BUZZER_PIN)
 
-def lcd_show(speed_kmh: float, label: str):
-    # řádek 1: Your speed: 50.7
-    # řádek 2: Too fast!
+# ---------------- Parameters ----------------
+gate_distance_m = 1.30     # meters between sensors
+speed_limit_kmh = 40.0     # speed limit
+trigger_dist_cm = 15.0     # detection distance (cm)
+min_dt_s = 0.05            # ignore false triggers
+
+# threshold_distance expects meters
+threshold_m = trigger_dist_cm / 100.0
+sensor1.threshold_distance = threshold_m
+sensor2.threshold_distance = threshold_m
+
+# ---------------- State Variables ----------------
+first_gate_triggered = False
+speed_calculated = False
+t1 = None
+t2 = None
+
+# ---------------- Helpers ----------------
+def lcd_show(line1: str, line2: str = ""):
+    # keep it simple & close to Arduino behavior
     lcd.clear()
-    line1 = f"Your speed:{speed_kmh:5.1f}"
-    line2 = label
-    lcd.write_string(line1[:16])
+    lcd.cursor_pos = (0, 0)
+    lcd.write_string(line1[:16].ljust(16))
     lcd.cursor_pos = (1, 0)
-    lcd.write_string(line2[:16])
+    lcd.write_string(line2[:16].ljust(16))
 
-def lcd_idle():
-    lcd.clear()
-    lcd.write_string("Ready...")
-    lcd.cursor_pos = (1, 0)
-    lcd.write_string("Pass A then B")
+def beep_3_times():
+    for _ in range(3):
+        buzzer.play(Tone(2000))  # ~2kHz
+        sleep(0.2)
+        buzzer.stop()
+        sleep(0.2)
 
-# ---------- SENSORY ----------
-a_sensor = DistanceSensor(echo=27, trigger=17, max_distance=1)
-b_sensor = DistanceSensor(echo=22, trigger=18, max_distance=1)
+# ---------------- Startup ----------------
+lcd_show("Speed Detector", "Waiting...")
 
-# vzdálenost mezi branama (metry)
-distance_m = 0.40
-
-# brána (metry)
-a_sensor.threshold_distance = 0.25
-b_sensor.threshold_distance = 0.25
-
-# filtr na šum / double-trigger (sekundy)
-min_dt = 0.03
-
-# rychlostní “město” pravidla (km/h)
-TOO_SLOW_MAX = 20.0     # pod 20: moc pomalu
-NORMAL_MAX   = 50.0     # 20–50: ok, nad 50: moc rychle
-
-start_time = None
-stop_time = None
-
-def start(t):
-    if t is None and a_sensor.in_range:
-        return monotonic()
-    return t
-
-def finish(t_stop, t_start):
-    if t_start is not None and t_stop is None and b_sensor.in_range:
-        return monotonic()
-    return t_stop
-
-def classify_speed(speed_kmh: float) -> str:
-    if speed_kmh > NORMAL_MAX:
-        return "Too fast!"
-    if speed_kmh < TOO_SLOW_MAX:
-        return "Too slow"
-    return "Normal"
-
-# ---------- RUN ----------
 try:
-    lcd_idle()
-
-    # odjištění na startu (ať to nechytá samo)
-    while a_sensor.in_range or b_sensor.in_range:
-        sleep(0.05)
-
     while True:
-        start_time = start(start_time)
-        stop_time = finish(stop_time, start_time)
+        # Read distances (Arduino did: d1 -> delay(40ms) -> d2)
+        d1_cm = sensor1.distance * 100.0
+        sleep(0.04)
+        d2_cm = sensor2.distance * 100.0
 
-        if start_time is not None and stop_time is not None:
-            dt = stop_time - start_time
+        # First sensor detects object
+        if (not first_gate_triggered) and (0 < d1_cm < trigger_dist_cm):
+            first_gate_triggered = True
+            t1 = monotonic()
 
-            if dt >= min_dt:
-                speed_m_s = distance_m / dt
-                speed_kmh = speed_m_s * 3.6
-                label = classify_speed(speed_kmh)
+            lcd_show("Vehicle detected", "Measuring...")
 
-                print(f"dt = {dt:.3f} s | speed = {speed_kmh:.1f} km/h | {label}")
-                lcd_show(speed_kmh, label)
+        # Second sensor detects object
+        if first_gate_triggered and (not speed_calculated) and (0 < d2_cm < trigger_dist_cm):
+            t2 = monotonic()
+            speed_calculated = True
+
+            delta_t = t2 - t1 if (t1 is not None) else 0.0
+
+            if delta_t > min_dt_s:
+                speed_kmh = (gate_distance_m / delta_t) * 3.6
+
+                # line1: Speed:xx.xkm/h
+                line1 = f"Speed:{speed_kmh:5.1f}km/h"
+                if speed_kmh > speed_limit_kmh:
+                    lcd_show(line1, "Over Speed!")
+                    beep_3_times()
+                else:
+                    lcd_show(line1, "Normal")
             else:
-                print(f"Ignored - dt too small: {dt:.4f} s")
-                lcd.clear()
-                lcd.write_string("Ignored noise")
-                lcd.cursor_pos = (1, 0)
-                lcd.write_string(f"dt:{dt:.4f}"[:16])
+                lcd_show("Invalid data", "")
 
-            # reset
-            start_time = None
-            stop_time = None
+            sleep(3.0)
 
-            # odjištění po průjezdu
-            while a_sensor.in_range or b_sensor.in_range:
-                sleep(0.02)
+            # Reset system (same as Arduino)
+            first_gate_triggered = False
+            speed_calculated = False
+            t1 = None
+            t2 = None
 
-            # zpět do idle
-            lcd_idle()
+            lcd_show("Speed Detector", "Waiting...")
 
         sleep(0.02)
 
 except KeyboardInterrupt:
     lcd.clear()
-    lcd.write_string("Stopped.")
-    print("Stopped.")
+    lcd.write_string("Stopped.".ljust(16))
+    buzzer.stop()
